@@ -15,10 +15,14 @@
     "@metamask/providers": "^14.0.2",
     "@mui/material": "^5.15.13",
     "@mui/x-data-grid": "^6.19.6",
+    "@next/swc-linux-x64-gnu": "13.5.1",
+    "@next/swc-linux-x64-musl": "13.5.1",
+    "bufferutil": "^4.0.8",
     "ethers": "^5.7.2",
     "next": "13.5.1",
     "react": "18.2.0",
-    "react-dom": "18.2.0"
+    "react-dom": "18.2.0",
+    "utf-8-validate": "^6.0.3"
   },
   "devDependencies": {
     "@types/node": "20.6.2",

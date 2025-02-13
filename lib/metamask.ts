@@ -26,12 +26,11 @@ export interface Account {
   holdings: TokenHolding[];
 }
 
-// Supported chains configuration
 const SUPPORTED_CHAINS = {
   ETH_MAINNET: {
     chainId: '0x1',
     name: 'ETHEREUM',
-    rpc: 'https://mainnet.infura.io/v3/your-project-id',
+    rpc: 'https://eth-mainnet.g.alchemy.com/v2/demo',
     nativeCurrency: {
       symbol: 'ETH',
       decimals: 18
@@ -40,7 +39,7 @@ const SUPPORTED_CHAINS = {
   BSC: {
     chainId: '0x38',
     name: 'BNB CHAIN',
-    rpc: 'https://bsc-dataseed.binance.org',
+    rpc: 'https://bsc-dataseed1.binance.org',
     nativeCurrency: {
       symbol: 'BNB',
       decimals: 18
@@ -72,16 +71,15 @@ const ERC20_ABI = [
   'function symbol() view returns (string)'
 ];
 
-// Helper function to wait for network change
 const waitForNetworkChange = async (targetChainId: string): Promise<void> => {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       cleanup();
       reject(new Error('Network change timeout'));
-    }, 3000);
+    }, 1500);
 
-    const handleNetworkChange = (networkId: string) => {
-      if (networkId === targetChainId) {
+    const handleNetworkChange = (networkId: unknown) => {
+      if (typeof networkId === 'string' && networkId === targetChainId) {
         cleanup();
         resolve();
       }
@@ -89,10 +87,10 @@ const waitForNetworkChange = async (targetChainId: string): Promise<void> => {
 
     const cleanup = () => {
       clearTimeout(timeout);
-      window.ethereum?.removeListener('chainChanged', handleNetworkChange);
+      window.ethereum?.removeListener('chainChanged', handleNetworkChange as (...args: unknown[]) => void);
     };
 
-    window.ethereum?.on('chainChanged', handleNetworkChange);
+    window.ethereum?.on('chainChanged', handleNetworkChange as (...args: unknown[]) => void);
   });
 };
 
@@ -103,29 +101,36 @@ async function switchChain(chainId: string): Promise<ethers.providers.Web3Provid
       params: [{ chainId }],
     });
 
-    // Wait for the network to actually change
     await waitForNetworkChange(chainId);
-
-    // Return a new provider instance after the network change
-    return new ethers.providers.Web3Provider(window.ethereum as any);
+    const provider = new ethers.providers.Web3Provider(window.ethereum as any);
+    await provider.ready; // Ensure provider is fully initialized
+    return provider;
   } catch (error: any) {
     if (error.code === 4902) {
       const chain = Object.values(SUPPORTED_CHAINS).find(c => c.chainId === chainId);
       if (chain) {
-        await window.ethereum?.request({
-          method: 'wallet_addEthereumChain',
-          params: [{
-            chainId: chain.chainId,
-            chainName: chain.name,
-            rpcUrls: [chain.rpc],
-            nativeCurrency: chain.nativeCurrency
-          }],
-        });
-        await waitForNetworkChange(chainId);
-        return new ethers.providers.Web3Provider(window.ethereum as any);
+        try {
+          await window.ethereum?.request({
+            method: 'wallet_addEthereumChain',
+            params: [{
+              chainId: chain.chainId,
+              chainName: chain.name,
+              rpcUrls: [chain.rpc],
+              nativeCurrency: chain.nativeCurrency
+            }],
+          });
+          await waitForNetworkChange(chainId);
+          const provider = new ethers.providers.Web3Provider(window.ethereum as any);
+          await provider.ready;
+          return provider;
+        } catch (addChainError) {
+          console.error('Error adding chain:', addChainError);
+          throw new Error(`Failed to add chain ${chain.name}`);
+        }
       }
     }
-    throw error;
+    console.error('Error switching chain:', error);
+    throw new Error(`Failed to switch to chain ${chainId}`);
   }
 }
 
@@ -182,41 +187,44 @@ export async function getAccountHoldings(address: string): Promise<TokenHolding[
   if (!window.ethereum) throw new MetaMaskError('MetaMask not installed');
 
   const holdings: TokenHolding[] = [];
-
-  // Check each supported chain
-  for (const chain of Object.values(SUPPORTED_CHAINS)) {
+  const chains = Object.values(SUPPORTED_CHAINS);
+  
+  // Process chains sequentially to avoid network switching conflicts
+  for (const chain of chains) {
     try {
-      // Switch to the chain and get a fresh provider
+      console.log(`Fetching holdings for ${chain.name}...`);
       const provider = await switchChain(chain.chainId);
       
-      // Get native token balance
-      const nativeBalance = await getNativeTokenBalance(provider, address, chain);
+      // Verify we're on the correct network
+      const network = await provider.getNetwork();
+      if (network.chainId !== parseInt(chain.chainId, 16)) {
+        console.error(`Network mismatch for ${chain.name}`);
+        continue;
+      }
+
+      const [nativeBalance, commonTokens] = await Promise.all([
+        getNativeTokenBalance(provider, address, chain),
+        Promise.all(
+          getCommonTokensForChain(chain.chainId).map(token =>
+            getTokenBalance(provider, token.address, address, chain.name)
+          )
+        )
+      ]);
+
       if (nativeBalance) {
         holdings.push(nativeBalance);
       }
 
-      // Get common token balances for this chain
-      const commonTokens = getCommonTokensForChain(chain.chainId);
-      const tokenBalances = await Promise.all(
-        commonTokens.map(token => 
-          getTokenBalance(provider, token.address, address, chain.name)
-        )
-      );
-
-      holdings.push(...tokenBalances.filter((b): b is TokenHolding => b !== null));
-
-      // Add a small delay between chain switches
-      await new Promise(resolve => setTimeout(resolve, 500));
+      holdings.push(...commonTokens.filter((b): b is TokenHolding => b !== null));
+      console.log(`Successfully fetched ${chain.name} holdings`);
     } catch (error) {
       console.error(`Error fetching ${chain.name} holdings:`, error);
-      continue;
     }
   }
 
   return holdings;
 }
 
-// Helper function to get common tokens for each chain
 function getCommonTokensForChain(chainId: string): { address: string; symbol: string }[] {
   switch (chainId) {
     case '0x1': // Ethereum
@@ -230,7 +238,6 @@ function getCommonTokensForChain(chainId: string): { address: string; symbol: st
         { address: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d', symbol: 'USDC' },
         { address: '0x55d398326f99059fF775485246999027B3197955', symbol: 'USDT' }
       ];
-    // Add more chains as needed
     default:
       return [];
   }
@@ -277,6 +284,6 @@ export function isMetaMaskInstalled(): boolean {
 
 export function setupAccountChangeListener(callback: (accounts: string[]) => void): void {
   if (typeof window !== 'undefined' && window.ethereum) {
-    window.ethereum.on('accountsChanged', callback);
+    window.ethereum.on('accountsChanged', callback as (...args: unknown[]) => void);
   }
 }

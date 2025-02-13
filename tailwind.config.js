@@ -9,4 +9,5 @@ module.exports = {
     extend: {},
   },
   plugins: [],
+  important: true, // This ensures Tailwind classes override MUI styles when needed
 };
