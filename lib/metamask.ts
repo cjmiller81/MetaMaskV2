@@ -1,4 +1,5 @@
 import { type MetaMaskInpageProvider } from '@metamask/providers';
+import { ethers } from 'ethers';
 
 declare global {
   interface Window {
@@ -25,119 +26,214 @@ export interface Account {
   holdings: TokenHolding[];
 }
 
-async function getChainName(chainId: string): Promise<string> {
-  if (!window.ethereum) throw new MetaMaskError('MetaMask not installed');
+// Supported chains configuration
+const SUPPORTED_CHAINS = {
+  ETH_MAINNET: {
+    chainId: '0x1',
+    name: 'ETHEREUM',
+    rpc: 'https://mainnet.infura.io/v3/your-project-id',
+    nativeCurrency: {
+      symbol: 'ETH',
+      decimals: 18
+    }
+  },
+  BSC: {
+    chainId: '0x38',
+    name: 'BNB CHAIN',
+    rpc: 'https://bsc-dataseed.binance.org',
+    nativeCurrency: {
+      symbol: 'BNB',
+      decimals: 18
+    }
+  },
+  POLYGON: {
+    chainId: '0x89',
+    name: 'POLYGON',
+    rpc: 'https://polygon-rpc.com',
+    nativeCurrency: {
+      symbol: 'MATIC',
+      decimals: 18
+    }
+  },
+  ARBITRUM: {
+    chainId: '0xa4b1',
+    name: 'ARBITRUM',
+    rpc: 'https://arb1.arbitrum.io/rpc',
+    nativeCurrency: {
+      symbol: 'ETH',
+      decimals: 18
+    }
+  }
+};
 
-  try {
-    // Get the chain information from MetaMask
-    const chainInfo = await window.ethereum.request({
-      method: 'eth_chainId',
-    });
+const ERC20_ABI = [
+  'function balanceOf(address owner) view returns (uint256)',
+  'function decimals() view returns (uint8)',
+  'function symbol() view returns (string)'
+];
 
-    // Map common chain IDs to names
-    const chainNames: { [key: string]: string } = {
-      '0x1': 'ETHEREUM',
-      '0x38': 'BNB CHAIN',
-      '0x89': 'POLYGON',
-      '0xa': 'OPTIMISM',
-      '0xa4b1': 'ARBITRUM ONE',
-      '0x2105': 'BASE',
-      '0xfa': 'FANTOM',
-      '0xa86a': 'AVALANCHE',
+// Helper function to wait for network change
+const waitForNetworkChange = async (targetChainId: string): Promise<void> => {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error('Network change timeout'));
+    }, 3000);
+
+    const handleNetworkChange = (networkId: string) => {
+      if (networkId === targetChainId) {
+        cleanup();
+        resolve();
+      }
     };
 
-    return chainNames[chainId] || `CHAIN ${parseInt(chainId, 16)}`;
-  } catch (error) {
-    console.error('Error getting chain name:', error);
-    return `CHAIN ${parseInt(chainId, 16)}`;
-  }
-}
+    const cleanup = () => {
+      clearTimeout(timeout);
+      window.ethereum?.removeListener('chainChanged', handleNetworkChange);
+    };
 
-async function getNativeTokenSymbol(chainId: string): Promise<string> {
-  const chainSymbols: { [key: string]: string } = {
-    '0x1': 'ETH',
-    '0x38': 'BNB',
-    '0x89': 'MATIC',
-    '0xa': 'ETH',
-    '0xa4b1': 'ETH',
-    '0x2105': 'ETH',
-    '0xfa': 'FTM',
-    '0xa86a': 'AVAX',
-  };
+    window.ethereum?.on('chainChanged', handleNetworkChange);
+  });
+};
 
-  return chainSymbols[chainId] || 'ETH';
-}
-
-async function getTokenBalance(
-  address: string,
-  chainId: string
-): Promise<TokenHolding | null> {
-  if (!window.ethereum) throw new MetaMaskError('MetaMask not installed');
-
+async function switchChain(chainId: string): Promise<ethers.providers.Web3Provider> {
   try {
-    // Switch to the chain
-    await window.ethereum.request({
+    await window.ethereum?.request({
       method: 'wallet_switchEthereumChain',
       params: [{ chainId }],
     });
 
-    // Get native token balance
-    const balance = await window.ethereum.request({
-      method: 'eth_getBalance',
-      params: [address, 'latest'],
-    }) as string;
+    // Wait for the network to actually change
+    await waitForNetworkChange(chainId);
 
-    const quantity = (parseInt(balance, 16) / 1e18).toFixed(4);
-    
-    // Only return if there's a balance
-    if (parseFloat(quantity) > 0) {
-      return {
-        symbol: await getNativeTokenSymbol(chainId),
-        chain: await getChainName(chainId),
-        quantity,
-        selected: false,
-      };
-    }
-
-    return null;
+    // Return a new provider instance after the network change
+    return new ethers.providers.Web3Provider(window.ethereum as any);
   } catch (error: any) {
-    // If chain switch failed, it might not be supported by the wallet
     if (error.code === 4902) {
-      return null;
+      const chain = Object.values(SUPPORTED_CHAINS).find(c => c.chainId === chainId);
+      if (chain) {
+        await window.ethereum?.request({
+          method: 'wallet_addEthereumChain',
+          params: [{
+            chainId: chain.chainId,
+            chainName: chain.name,
+            rpcUrls: [chain.rpc],
+            nativeCurrency: chain.nativeCurrency
+          }],
+        });
+        await waitForNetworkChange(chainId);
+        return new ethers.providers.Web3Provider(window.ethereum as any);
+      }
     }
-    console.error('Error fetching token balance:', error);
-    return null;
+    throw error;
   }
 }
 
+async function getNativeTokenBalance(
+  provider: ethers.providers.Web3Provider,
+  address: string,
+  chain: typeof SUPPORTED_CHAINS[keyof typeof SUPPORTED_CHAINS]
+): Promise<TokenHolding | null> {
+  try {
+    const balance = await provider.getBalance(address);
+    if (!balance.isZero()) {
+      return {
+        symbol: chain.nativeCurrency.symbol,
+        chain: chain.name,
+        quantity: ethers.utils.formatUnits(balance, chain.nativeCurrency.decimals),
+        selected: false
+      };
+    }
+  } catch (error) {
+    console.error(`Error fetching native balance for ${chain.name}:`, error);
+  }
+  return null;
+}
+
+async function getTokenBalance(
+  provider: ethers.providers.Web3Provider,
+  tokenAddress: string,
+  walletAddress: string,
+  chainName: string
+): Promise<TokenHolding | null> {
+  try {
+    const contract = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
+    const [balance, symbol, decimals] = await Promise.all([
+      contract.balanceOf(walletAddress),
+      contract.symbol(),
+      contract.decimals()
+    ]);
+    
+    if (!balance.isZero()) {
+      return {
+        symbol,
+        chain: chainName,
+        quantity: ethers.utils.formatUnits(balance, decimals),
+        selected: false
+      };
+    }
+  } catch (error) {
+    console.error(`Error checking token ${tokenAddress}:`, error);
+  }
+  return null;
+}
+
 export async function getAccountHoldings(address: string): Promise<TokenHolding[]> {
+  if (!window.ethereum) throw new MetaMaskError('MetaMask not installed');
+
   const holdings: TokenHolding[] = [];
 
-  // Common chains to check
-  const chainIds = [
-    '0x1',   // Ethereum
-    '0x38',  // BNB Chain
-    '0x89',  // Polygon
-    '0xa',   // Optimism
-    '0xa4b1',// Arbitrum One
-    '0x2105',// Base
-    '0xfa',  // Fantom
-    '0xa86a' // Avalanche
-  ];
-
-  // Check balances on all supported chains
-  for (const chainId of chainIds) {
+  // Check each supported chain
+  for (const chain of Object.values(SUPPORTED_CHAINS)) {
     try {
-      const holding = await getTokenBalance(address, chainId);
-      if (holding) {
-        holdings.push(holding);
+      // Switch to the chain and get a fresh provider
+      const provider = await switchChain(chain.chainId);
+      
+      // Get native token balance
+      const nativeBalance = await getNativeTokenBalance(provider, address, chain);
+      if (nativeBalance) {
+        holdings.push(nativeBalance);
       }
+
+      // Get common token balances for this chain
+      const commonTokens = getCommonTokensForChain(chain.chainId);
+      const tokenBalances = await Promise.all(
+        commonTokens.map(token => 
+          getTokenBalance(provider, token.address, address, chain.name)
+        )
+      );
+
+      holdings.push(...tokenBalances.filter((b): b is TokenHolding => b !== null));
+
+      // Add a small delay between chain switches
+      await new Promise(resolve => setTimeout(resolve, 500));
     } catch (error) {
-      console.error(`Error fetching balance for chain ${chainId}:`, error);
+      console.error(`Error fetching ${chain.name} holdings:`, error);
+      continue;
     }
   }
 
   return holdings;
+}
+
+// Helper function to get common tokens for each chain
+function getCommonTokensForChain(chainId: string): { address: string; symbol: string }[] {
+  switch (chainId) {
+    case '0x1': // Ethereum
+      return [
+        { address: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', symbol: 'USDC' },
+        { address: '0xdAC17F958D2ee523a2206206994597C13D831ec7', symbol: 'USDT' },
+        { address: '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599', symbol: 'WBTC' }
+      ];
+    case '0x38': // BSC
+      return [
+        { address: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d', symbol: 'USDC' },
+        { address: '0x55d398326f99059fF775485246999027B3197955', symbol: 'USDT' }
+      ];
+    // Add more chains as needed
+    default:
+      return [];
+  }
 }
 
 export async function connectMetaMask(): Promise<Account[]> {
